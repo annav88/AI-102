@@ -4,6 +4,9 @@ using System.Text;
 using Microsoft.Extensions.Configuration;
 
 // Import namespaces
+ // import namespaces
+ using Azure;
+ using Azure.AI.TextAnalytics;
 
 
 namespace text_analysis
@@ -25,7 +28,9 @@ namespace text_analysis
                 Console.OutputEncoding = Encoding.Unicode;
 
                 // Create client using endpoint and key
-
+                AzureKeyCredential credentials = new AzureKeyCredential(cogSvcKey);
+                Uri endpoint = new Uri(cogSvcEndpoint);
+                TextAnalyticsClient CogClient = new TextAnalyticsClient(endpoint, credentials);
 
                 // Analyze each text file in the reviews folder
                 var folderPath = Path.GetFullPath("./reviews");  
@@ -40,7 +45,8 @@ namespace text_analysis
                     Console.WriteLine("\n" + text);
 
                     // Get language
-
+                    DetectedLanguage detectedLanguage = CogClient.DetectLanguage(text);
+                    Console.WriteLine($"\nLanguage: {detectedLanguage.Name}");
 
                     // Get sentiment
 

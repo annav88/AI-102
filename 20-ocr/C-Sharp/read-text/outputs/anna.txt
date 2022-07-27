@@ -1,0 +1,1964 @@
+Hyperspace: The Indexing Subsystem of Azure Synapse
+Rahul Potharaju, Terry Kim, Eunjin Song, Wentao Wu, Lev Novik,
+Apoorve Dave, Andrew Fogarty, Pouria Pirzadeh, Vidip Acharya, Gurleen Dhody, Jiying Li,
+Sinduja Ramanujam, Nicolas Bruno, César A. Galindo-Legaria, Vivek Narasayya,
+Surajit Chaudhuri, Anil K. Nori, Tomas Talius, Raghu Ramakrishnan
+Microsoft Corporation
+hyperspace@microsoft.com
+ABSTRACT
+the same time, we observe data warehouses expanding their capa-
+Microsoft recently introduced Azure Synapse Analytics, which of-
+bilities to support data diversity and scale to match lake capabilities.
+fers an integrated experience across data ingestion, storage, and
+This convergence of warehouses and lakes adds value through ser-
+querying in Apache Spark and T-SQL over data in the lake, in-
+vice interoperability and consistent capabilities—including security,
+cluding files and warehouse tables. In this paper, we present our
+governance, lifecycle management, and cost management—over all
+experiences with designing and implementing Hyperspace, the in-
+data: in the cloud, on the edge, or on-prem.
+dexing subsystem underlying Synapse. Hyperspace enables users
+Microsoft recently introduced Azure Synapse [2], which offers
+to build multiple types of secondary indexes on their data, main-
+an integrated experience across data ingestion, storage, and query-
+tain them through a multi-user concurrency model, and leverage
+ing in Apache Spark [15] and T-SQL, over data in the lake and
+them automatically—without any change to their application code—
+warehouse tables. Our customers store datasets ranging from a few
+for query/workload acceleration. Many requirements of Hyper-
+GBs to 100s of PBs and utilize several analytical engines to pro-
+space are based on feedback from several enterprise customers. We
+cess this data. The scope of usage spans traditional data processing
+present the details of Hyperspace’s underlying design, the user-
+(e.g., ETL), analytical (e.g., OLAP), exploratory (e.g., “needle in a
+facing APIs, its concurrency control protocol for index access, its
+haystack” queries) and deep learning workloads.
+index-aware query processing techniques, and its maintenance
+Based on our experience working with customers, we observed
+mechanisms for handling index updates. Evaluations over standard
+that most enterprise workloads begin with data streaming contin-
+industry benchmarks and real customer workloads show that Hy-
+uously into the data lake via various means (e.g., telemetry from
+perspace can accelerate query execution by up to 10x and in certain
+edge devices, usage data from business applications, click-stream
+real-world workloads, even up to two orders of magnitude.
+data in web apps and search engines). Subsequently, complex ETL
+pipelines transform this data for downstream consumption and
+PVLDB Reference Format:
+make it available to data and business analysts via shared derived
+Rahul Potharaju, Terry Kim, Eunjin Song, Wentao Wu, Lev Novik, Apoorve
+datasets or traditional reporting applications. It is expected that
+Dave, Andrew Fogarty, Pouria Pirzadeh, Vidip Acharya, Gurleen Dhody,
+the underlying data can be updated due to various business re-
+Jiying Li, Sinduja Ramanujam, Nicolas Bruno, César A. Galindo-Legaria,
+quirements (e.g., to enforce privacy policies like GDPR [42], as
+Vivek Narasayya, Surajit Chaudhuri, Anil K. Nori, Tomas Talius, Raghu
+part of hybrid transaction/analytical processing pipelines [17], cor-
+Ramakrishnan. Hyperspace: The Indexing Subsystem of Azure Synapse.
+rections due to accounting errors). To meet critical business and
+PVLDB, 14(12): 3043 - 3055, 2021.
+strict SLA requirements, users spend significant time in optimizing
+doi:10.14778/3476311.3476382
+their pipelines. On one hand, to obtain desired performance, users
+PVLDB Artifact Availability:
+spend a lot of time and energy creating several derived datasets
+The source code, data, and/or other artifacts have been made available at
+each with their own sort-orders and/or partitioning, hand-tuned /
+https://github.com/microsoft/hyperspace.
+optimized for their query patterns—increasingly assuming the role
+of big data administrators. On the other hand, to handle updates
+1
+INTRODUCTION
+efficiently and avoid GDPR penalties, enterprise users implement
+The on-going convergence of data lakes and data warehouses is see-
+custom solutions—increasingly assuming the role of big data archi-
+ing the emergence of support for efficiently updatable and versioned
+tects—and spend significant effort in dataset lifecycle management.
+relational data with change tracking [27, 28, 30], and competitive
+While some of the difficulties around streaming ingestion and
+relational query capabilities at very large scale [2]. We are seeing
+handling updates are addressed by recent work on updatable for-
+out-of-box support for relational tool chains for reporting, data
+mats [27, 28, 30], the whole experience of having to manage lifecy-
+orchestration, security, sharing, compliance, and governance. At
+cle of derived datasets and then having to manually decide which
+dataset to use to obtain the required query acceleration is frustrat-
+ing, error-prone and a far cry from what traditional databases have
+This work is licensed under the Creative Commons BY-NC-ND 4.0 International
+License. Visit https://creativecommons.org/licenses/by-nc-nd/4.0/ to view a copy of
+advocated for and provided. We argue that a system that offers a
+this license. For any use beyond those covered by this license, obtain permission by
+simple user experience, hides the complexity of building and manag-
+emailing info@vldb.org. Copyright is held by the owner/author(s). Publication rights
+ing these datasets and allows transparent usage in query processing
+licensed to the VLDB Endowment.
+Proceedings of the VLDB Endowment, Vol. 14, No. 12 ISSN 2150-8097.
+is critical for any industrial offering such as Azure Synapse. Specifi-
+doi:10.14778/3476311.3476382
+cally, such a system needs to address two challenges in the context
+3043
+of data lakes: how to efficiently store a derived dataset, maintain it
+pruning of the search space. Since the log is stored in the lake, Hy-
+and make it available to query engines in the lake, and how to auto-
+perspace offers a “serverless” index management solution, i.e., users
+matically select the best derived dataset during query optimization.
+only need to launch a batch job to refresh the index and can benefit
+With these in mind, we designed Hyperspace, an indexing sub-
+from scalable computation (to refresh the index). Further, such a
+system that we started offering to customers and open-sourced in
+design also enables providing multi-engine index experiences and
+2020 [43]. The key idea behind Hyperspace is simple: Users specify
+integrating Hyperspace into Polaris [13].
+the derived datasets (referred to henceforth as indexes) that they
+(5) Integration with query optimizer. The current experience of Hy-
+want to build.1 Hyperspace builds these indexes using an existing
+perspace inside Apache Spark is quite simple and requires no code
+scale-out engine, Apache Spark [15], and maintains metadata in
+change from its users. This was achieved through an integration
+its write-ahead log that is stored in the data lake. At runtime, Hy-
+with the underlying query optimizer that is agnostic to end users,
+perspace automatically selects the best index to use for a given
+allowing the optimizer to make good choices of which indexes to
+query without requiring users to rewrite their queries. Hyperspace
+use to answer a query rather than forcing application developers
+indexes are exposed to users as an alternative performance enhance-
+to choose indexes, thereby simplifying usability.
+ment option and are complementary to other query acceleration
+Based on this simple design, we built several features in Hyper-
+mechanisms such as data partitioning [61] available for data lakes.
+space to address common customer pain points. First, the ability
+Our key contributions in this paper are:
+to incrementally refresh an index (Section 5.2) in the data lake is
+•
+Indexing Subsystem for Data Lakes. We present the details of
+suitable for common streaming workloads. Using lineage mecha-
+an extensible indexing engine, the user experience, the underlying
+nisms (Section 3.1), Hyperspace supports even the most advanced
+physical layouts, how we leverage indexes for query acceleration,
+data formats such as Delta Lake [30] that support updates (Sec-
+and describe the index management lifecycle.
+tion 5.3) including their time travel feature. Second, Hyperspace
+•
+Serverless Index Management. To lower operational costs,
+offers out-of-box support for history tracking through its trans-
+we propose a novel “serverless” index management strategy. We
+action log (Section 4.1), useful in audit logging for security and
+also discuss how such a design enables us to provide multi-engine
+compliance. Third, to avoid problems with handling large num-
+interoperability and multi-user concurrency.
+bers of files, Hyperspace offers an OPTIMIZE command that can
+•
+Large-Scale Evaluation. We present an evaluation of Hyper-
+bin-pack index files into a compact representation (Section 5.2). Fi-
+space using both industry benchmarks and real customer workloads,
+nally, Hyperspace allows users to continue to exploit stale indexes3
+TPC-H, TPC-DS, and Customer. Overall, we have observed gains
+through its novel hybrid scan mechanism (Section 6.2), without
+of 40% to 75% for TPC-H, 50% for TPC-DS, and 44% to 94% for
+sacrificing correctness.
+Customer, using commodity hardware. In some cases, we saw
+Hyperspace offers users a simple framework to optimize the
+speedups of over two orders of magnitude.
+management and performance of their workloads. While indexing
+In more detail, there were several considerations that went into
+is not a silver bullet, we have observed significant workload accel-
+designing Hyperspace:
+eration, with some customers reporting speedups as high as two
+(1) Agnostic to data formats. Hyperspace is format-agnostic and sup-
+orders of magnitude. The open-source Hyperspace project [43] en-
+ports indexing most popular formats (e.g., CSV, JSON, Parquet [1]).
+ables indexing support in Apache Spark and supports most widely
+(2) Indexes are data. The index itself is stored in the lake like any
+used data formats such as CSV, JSON, Delta Lake, and Iceberg. It
+other dataset in an open and efficient columnar format, Parquet2
+is currently in use by several enterprises, three of which are large
+,
+which has the following major benefits. First, in practice many
+enterprises including Microsoft. In the rest of this paper we present
+queries only access subsets of (instead of all) columns from underly-
+the design and implementation of Hyperspace.
+ing tables. Second, users continue to benefit from a large number of
+Scope. There have been techniques for accelerating query perfor-
+optimizations being committed by ∼200 developers from the open-
+source communities [7, 29]. For example, Parquet’s min-max based
+mance in big data systems, in particular, by using various types of in-
+dexes (e.g., Z-order [47] in Delta Lake [30], R-tree in GeoSpark [65],
+pruning allows skipping irrelevant data blocks; as a result, scanning
+Reflections in Dremio [24]). Hyperspace indexes share similar goals
+Hyperspace indexes can have similar performance benefits offered
+with these techniques in this aspect. However, Hyperspace is not
+by other well-known techniques such as zone maps. Third, users
+only a query acceleration technology; rather, its emphasis is more
+also benefit from broader community efforts to bring hardware
+on the automated lifecycle management of such query accelerators
+acceleration via GPUs [4, 51] and FPGAs [5].
+(3) Diverse use cases. Developers are provided a flexible framework
+in the big data and/or data lake world, enabling simplified index cre-
+ation/maintenance and automated index utilization. It is in this latter
+to extend and build their own auxiliary structures (e.g., B-tree,
+R-Tree) in addition to indexes already supported by Hyperspace.
+aspect that we are not aware of existing technology that shares
+(4) Serverless and multi-engine indexes. Hyperspace stores the index
+similar goals. In a sense, Hyperspace is complementary to the above
+specific indexing techniques and allows for incorporation of any
+and the associated metadata on the lake. The metadata log contains
+(a) lineage that allows Hyperspace to enable seamless incremen-
+type of index into the end-to-end index utilization and management
+tal index refresh operations and (b) statistics that allow very fast
+experience. The extensible and open design of Hyperspace allows
+it to take advantage of state-of-the-art in big data technology while
+1Note that we abuse terminology a bit for ease of exposition, as derived datasets can be
+offering simplified end-user experiences to customers and staying
+more general than indexes in their traditional sense. For example, a materialized view
+open to community contributions.
+is a type of derived dataset that is typically not considered an index in the literature.
+2Hyperspace can easily be extended to store its indexes in other columnar formats.
+3
+Indexes go stale when the underlying data is modified but the index was not refreshed.
+3044
+Availability. Hyperspace has been open-sourced [43] and oper-
+data lake leading to sub-optimal performance. For instance, data
+ates in Microsoft’s own production environments [44].
+is generally partitioned by timestamp but most queries select by
+Paper organization. This paper is organized as follows. In Sec-
+sensor id instead. To avoid linear scans, we have observed customers
+tion 2, we present real-world use cases of Hyperspace in Azure
+using Hyperspace to create secondary indexes to efficiently answer
+Synapse Analytics. In Section 3, we discuss the design goals behind
+such queries. An interesting observation here is that Hyperspace
+Hyperspace and provide an overview of its capabilities along with
+maintenance works well with any retention rates associated with
+the public APIs. In Section 4, we explain how we implement Hyper-
+the underlying raw data.
+space as a low-cost indexing subsystem. In Section 5, we present
+Complex View Support over Lake Data. With data from multi-
+the incremental index maintenance mechanism in Hyperspace. In
+ple sources flowing into the lake, in near real-time, applications are
+Section 6, we discuss how the query optimizer utilizes Hyperspace
+increasingly leveraging lake data for operational processing and
+indexes in query processing. In Section 7, we present evaluation
+analytics. Operational data processing requires support for data ab-
+results of Hyperspace. We discuss related work in Section 8, and
+stractions from source operational system and support for complex
+present our conclusions in Section 9.
+read processing. SQL views[13] are a useful way to provide such
+abstractions. These abstractions themselves can be complex. For
+2
+HYPERSPACE USE CASES
+example, consider a User (or Contact) entity in the lake, which is
+Hyperspace has been evolving continuously since its inception
+composed from multiple source datasets like user core data, user
+almost three years ago based on customer feedback. While Hyper-
+address data, user profile data, and so on, requiring multi-way joins.
+space is broadly applicable to any query acceleration scenarios, in
+Efficient support for such views requires efficient query processing
+this section, we present some representative patterns leveraged by
+over source datasets. Hyperspace can provide support for efficient
+customers within Azure Synapse Analytics [44].
+query processing over source datasets and over other views, with-
+out requiring them to be physically materialized.
+High-Concurrency Interactive Analytics and Data Export. A
+common scenario we observed in enterprise applications in vari-
+Framework for Derived Dataset Maintenance. Many enter-
+ous sectors such as finance, accounting, and sales, is the following:
+prise workloads are migrating ETL and data warehouse workloads
+Users can input some predicates and they can either look at the re-
+to the cloud to simplify their management. In certain use cases,
+sults or export the data. Since there are multiple query patterns,
+enterprises take regular snapshots of data in OLTP systems (e.g.,
+a single layout (e.g., data partitioning, distribution, or sort-order)
+sales) and join it with other richer sources (e.g., product usage) to
+may not suffice to meet all SLAs. We observed customers utilizing
+derive other useful insights. We find many of these enterprises still
+Hyperspace to create multiple indexes on their data (~8 TB/day) and
+prefer storing their raw data in CSV files as they do not want to
+leveraging its index caching mechanism to preemptively load in-
+impose restrictions for downstream pipelines. We observed users
+dexes (~700 GB/day) into an active set of nodes (~60). Subsequently,
+using Hyperspace to define materialized views—a type of derived
+they would build an intermediate index serving layer that takes in
+datasets/indexes in Hyperspace—as optimized representations of
+queries, writes the results into a blob store, and returns a URI to the
+the raw data. This not only allows downstream pipelines to benefit
+end user so they can download. In some cases, customers obtained
+from query acceleration but also allows the teams to exploit Hy-
+speedups of up to two orders of magnitude.
+perspace’s maintenance framework to keep everything up-to-date
+when the underlying data changes.
+Indexing Privacy Attributes for GDPR Compliance. The Gen-
+eral Data Protection Regulation (GDPR) [42] is a protection directive
+Needle-in-a-haystack Queries. Many customers are interested
+introduced by the European parliament that requires companies
+in text searches in a large set of files on the lake across all columns.
+holding EU citizen data to provide a certain level of protection for
+Bloom filter indexes can be used to address the problem. An in-
+personal data (e.g., biometric data, user activity data, etc.), including
+teresting side-effect would be their benefits in join optimizations,
+erasing all personal data upon request. This requirement applies to
+which we plan to address in future work.
+any product or service that collects user information (e.g., health
+3
+HYPERSPACE INDEXING SUBSYSTEM
+and fitness, chat, etc.). We observed customers utilizing Hyperspace
+indexes to speed up searches for which data blobs hosted by Azure
+In this section, we present an overview of Hyperspace and its APIs,
+Storage (i.e., WASB [11]) contain the given user’s data (via “lookup”
+and discuss the underlying index structures. Hyperspace is designed
+style queries). Once these blobs are deleted, users perform an index
+to work with multiple query engines, but for concreteness, we
+refresh to delete the entries from the index. Since Hyperspace of-
+explain the indexing subsystem and its use in the context of Apache
+fers incremental refresh with support for deletes, this operation is
+Spark, without loss of generality.
+efficient (as it only rewrites index blocks that are affected).
+3.1
+Hyperspace Indexes
+Time-series Analytics. Many customers focus on turning IoT
+Hyperspace supports traditional non-clustered indexes (i.e., index
+data into actionable insights using products such as Time Series
+is separated from data). Hyperspace indexes have the following
+Insights [45] that allow users to specify the sensors from which to
+physical properties (see Figure 1):
+collect time series data and allow them to slice and dice so they can
+(1) Columnar: Index is stored in a columnar format (we use Par-
+derive insights. A common pattern of requests we observed is that
+quet, but in principle any other format can be used). This not
+for data spanning multiple years, users issue queries in ways that
+only allows us to benefit from community contributed optimiza-
+do not align with how the data is partitioned/distributed on the
+tions and hardware advancements but also leverage techniques
+3045
+(a) Physical Layout of the Index
+(b) Example Usage for Shuffle Elimination
+(c) Example Usage for Filter Evaluation
+Dataset
+Input Configuration
+Input Configuration
+Tables:
+Query:
+Indexes:
+Tables:
+R(a,b)
+SELECT a,d FROM R, S
+Query:
+Indexes:
+1. Filter Idx
+S(c,d)
+WHERE R.b = S.c AND
+F1: [R.a; R.b]
+R(a,b)
+SELECT a,d FROM R, S
+1. Filter Idx
+R.a = 5 AND S.d > 200
+2. Join Idx
+S(c,d)
+WHERE R.b = S.c AND
+F1: [R.a; R.b]
+Index
+J1: [R.b; R.a]
+R.a = 5 AND S.d > 200
+J2: [S.c; S.d]
+Original
+Query
+Optimized
+Original
+Query
+Optimized
+Query Plan
+Optimizer
+Query Plan
+Query Plan
+Optimizer
+Query Plan
+Project
+Project
+Project
+Project
+R.a, S.d
+F1.a, S.d
+R.a, S.d
+J1.a, J2.d
+Partition-1
+Partition-2
+Partition-3
+Join
+Join
+Index Columns
+Join
+Join
+R.b = S.c
+F1.b = S.c
+R.b = S.c
+J1.b = J2.c
+Hash-partitioned &
+Filter
+Filter
+Filter
+Filter
+Filter
+Filter
+Filter
+Filter
+Sorted (within each
+R.a = 5
+S.d > 200
+J1.a = 5
+J2.d > 200
+R.a = 5
+S.d > 200
+F1.a = 5
+S.d > 200
+partition) by the
+Relation
+Relation
+Index Columns.
+Covering
+Convering
+Relation
+Relation
+Relation
+Relation
+R
+S
+Idx J1
+Idx J2
+R
+S
+R'
+S
+Included Columns
+URI
+Replace Table Scan with Index Scan
+Reduce Table Scan with Index Seek
+Figure 1: Hyperspace Indexes. (a) describes the physical layout; (b) and (c) show examples of shuffle and filter acceleration.
+like vectorization along with min-max pruning [46] to acceler-
+ate scans over indexes.
+category
+distribution agnostic (shuffles data)
+distribution aware (avoids shuffle)
+(2) Hash-Partitioned & (Optionally) Sorted: Index is hash par-
+20
+titioned and sorted by the index columns within each individual
+partition, based on user-provided index configuration. Index
+15
+columns can hold generic data types, e.g., bloom filters. This
+10
+allows index scans to reduce the amount of data to be accessed
+5
+for filter with equality predicates (i.e., point look-ups) that ref-
+Time (seconds)
+erence the indexed columns. If the indexed columns match join
+0
+30
+60
+300
+470
+keys and the optimizer chooses to use a shuffle-based join (e.g.,
+# cores used
+a hash join or a sort-merge join), then the shuffle stage of the
+Figure 2: Benefits of getting rid of shuffles.
+join can be avoided due to the index being pre-partitioned [3].
+a global distributed shuffle, and (ii) query engine is not aware of the
+(3) (Optional) Lineage Tracking: Every index can also optionally
+underlying data distributions so it will perform a full distributed
+hold pointers/references to the underlying base table (inciden-
+shuffle. We compare the query execution time as the number of
+tally, these are also useful for lineage tracking and enforcing
+CPU cores grow, for both cases (i) and (ii) with the following micro-
+deletes; see Section 5.2). However, since data in the lake does
+benchmark query:
+not typically have a primary key or a clustered index, in Hy-
+perspace we exploit the following observation for data lake
+SELECT count(*) FROM lineitem, orders
+implementations [19, 57, 59]: Each file/blob/folder in the under-
+WHERE l_orderkey = o_orderkey.
+lying storage system is addressible through a handle (e.g., URI)
+Here lineitem and orders are the two largest tables in the 1TB
+that can be used to efficiently retrieve the underlying data. Users
+TPC-H benchmark [10]. Notice the difference of up to 2.5x in query
+can create secondary indexes that map the indexed columns to
+execution time between the two cases. This difference will increase
+the handle of a data block that contains the full record. We note
+significantly as the amount of shuffling increases; see Section 7.
+that Hyperspace allows the URI to be either fine-grained (e.g.,
+directly pointing to a row-group in Parquet) or coarse-grained
+Reduce Table Scans with Index Seeks. When the index does not
+(e.g., pointing to a file or a folder).
+cover the given query, it may still be useful for reducing the amount
+of data accessed by a table scan, as shown in Figure 1(c). During
+Such indexes allow the following key query optimizations:
+query optimization, Hyperspace uses such indexes to eliminate por-
+tions of the table that can be skipped, based on column selectivity.
+Replace Table Scans with Index Scans. When the index con-
+Remark. In practice, it is easy to include other types of indexes into
+tains all information required to resolve a query as part of its key
+Hyperspace as long as they can be used for index scans or seeks.
+columns (a.k.a., “indexed columns”) and data/payload columns (a.k.a,
+Indeed, with this point of view, we are embedding several other
+“included columns”)—a covering index—they can be tremendously
+well-known data structures, such as materialized views, Z-ORDER,
+useful for “index-only” access paths (including for optimizing joins);
+data skipping, sketches, inverted lists and even bloom filters, into
+see Figure 1(b). For instance, in cases where one or more joins have
+Hyperspace [43]. One obvious challenge is how to use these in-
+appropriate partition-aligned indexes, global shuffles (some of the
+dexes to accelerate query processing, which implies that the query
+most expensive operations in data lakes [54]) can be entirely elimi-
+optimizer needs to be able to rewrite the query plan when such
+nated. We illustrate these benefits through an empirical study that
+indexes are available and estimate their execution cost accordingly;
+we conducted to measure the benefits of avoiding data shuffling
+see Section 6. Another challenge is to ensure the freshness of such
+under two scenarios: (i) query engine is aware of the underlying
+indexes when the underlying datasets are updated, which implies
+data distributions of the two tables involved in a join so it can avoid
+that index maintenance is critical in Hyperspace; see Section 5.
+3046
+User-facing Index Management APIs
+Filesystem Root
+allows interaction with the indexing ecosystem
+/indexes/<scope = public | user | namespace>
+<index name>
+Query Infrastructure
+_hyperspace_log
+1
+Index Recommendation
+2
+Optimizer Extensions
+3
+making optimizer cost and
+allows index suggestions for query/workload
+.
+.
+.
+index-aware, algorithms for
+What-If
+<index-directory-1>
+index selection
+<index-directory-2>
+allows index cost-benefit analysis
+<index-directory-3>
+Indexing Infrastructure
+/path/to/data/1
+Index Creating & Maintenance API
+data files
+primitives for index lifecycle management (e.g., creating, refreshing,
+Figure 4: Index Organization on the Data Lake.
+deleting), enforcing retention, purge etc.
+perform transparent query rewriting to utilize the indexes. The only
+Log Management API
+Index Specs
+Concurency Model
+step required is to enable Hyperspace’s optimizer extensions via
+change log for enabling
+layouts for enabling
+primitives for
+engine-interoperability
+engine-interoperability
+optimistic concurrency
+sparkSession.enableHyperspace()
+Data Lake
+after creating the Spark session. Since we treat an index as another
+Datasets
+Index
+dataset on the lake, users can exploit Spark’s distributed nature to
+structured e.g., parquet and
+non-clustered (columnar covering
+automatically scale out index scans.
+unstructured e.g., csv, tsv
+index, partition pruning, stats, views)
+Index Tuning. While Hyperspace introduces the notion of index-
+Figure 3: Overview of Hyperspace Indexing Subsystem.
+ing, an important aspect of big data administration that critically
+3.2
+Architectural Overview
+influences performance is the ability to select indexes to build for a
+Figure 3 shows an architectural overview of Hyperspace. At its
+given query/workload. To decide the right indexes for a workload,
+core, Hyperspace offers two layers:
+users must be able to perform a cost-benefit analysis of the existing
+indexes and any “hypothetical” indexes [21] they have in mind.
+Indexing Infrastructure: At a bare minimum, users can utilize
+Hyperspace’s “what if” functionality [18, 21, 32–34] allows users
+the indexing infrastructure (available as a service or a library) to
+to quantitatively analyze the impact of existing or hypothetical
+create and maintain indexes on their data through the index cre-
+indexes on performance of the system. In addition, Hyperspace also
+ation and maintenance API (discussed in Section 3.4). Since indexes
+exposes an implementation of index recommendation [20, 37, 63]
+and their metadata are stored in the data lake (see Section 3.3 for
+for automating the choice of indexes for query acceleration in big
+justification), users can parallelize index scans to the extent that
+data workloads. Given certain constraints, such as the maximum
+their query engine scales and their environment/business allows.
+number of indexes allowed and the storage budget, this utility se-
+Index metadata management is another important part of the in-
+lects the best Hyperspace indexes for an input workload in terms
+dexing infrastructure. Internally, index metadata maintenance is
+of percentage improvement of workload execution cost.
+managed by an index manager. The index manager takes charge of
+index metadata creation, update, and deletion when correspond-
+3.3
+Index Organization on the Lake
+ing modification happens to the indexed data, and thus governs
+To meet the design goals outlined in the introduction, we decided
+consistency between index and its metadata.
+to store all index metadata in the lake, without any external depen-
+For developers and contributors of Hyperspace, the system also
+dencies (details in Section 4). Figure 4 shows the organization of the
+offers access to the underlying primitive components. Of particular
+index metadata on the data lake file system. Each index (listed under
+interest are the following:
+/indexes/*/<index name> in Figure 4) has two components:
+(1) the directory named _hyperspace_log that contains the
+•
+Log Management API: A critical design decision we took in or-
+der to support multi-engine interoperability was to store all the
+operational log of the index, i.e., the list of all operations that
+indexes and their metadata in the lake. To track the lineage of
+happened on this index since its inception;
+the operations that take place over an index, Hyperspace records
+(2) the actual contents of the index.
+user operations in an operation log (Section 4.1).
+Notice that the contents are captured through multiple directories.
+•
+Index Specs: To support extensibility, Hyperspace requires certain
+This is to support functionality such as concurrent index manage-
+properties from the underlying indexes. These are exposed via
+ment (e.g., snapshot isolation) and incremental maintenance (e.g.,
+the lifecycle management API and anyone wanting to add an
+the latest index is a union of the contents of multiple directories).
+additional auxiliary data structure must implement this API.
+Concurrency Model: To support multi-user and incremental main-
+3.4
+Usage API & Customization Knobs
+•
+tenance scenarios, we use optimistic concurrency control mecha-
+Hyperspace offers a list of public APIs that can be grouped into the
+nisms (Section 4.3).
+following categories:
+Query Infrastructure: Without loss of generality, we discuss the
+Index maintenance APIs such as create, delete, restore, vacuum,
+components of the query infrastructure implemented in the Scala
+refresh, and cancel. The delete API performs a “soft delete,” which
+version of Hyperspace. The library is written as an extension of the
+tells the optimizer to not consider this index during optimization.
+Spark optimizer (a.k.a. Catalyst) to make it index-aware, i.e., given
+The actual index is not deleted, thus allowing the user to recover
+a query along with existing indexes, Hyperspace-enabled Spark can
+the deleted index using the restore API. Alternately, the user can
+3047
+permanently delete the index (already in a soft-delete state) using
+•
+Contents, which captures the type and type-specific informa-
+the vacuum API. Users can cancel on-going index maintenance
+tion of the derived dataset that is useful in instantiating appropriate
+operations using the cancel API; this is useful if the user suspects
+index interpretation logic, such as name, kind, configuration (e.g.,
+that the maintenance job is stuck or has failed.
+indexed and included columns plus their types), content (e.g., phys-
+Utility APIs for debugging and recommendation such as ex-
+ical location and layout);
+plain, whatIf, and recommend. The explain API allows users to obtain
+•
+Lineage, which captures information required to track lineage
+various useful information from the optimizer, e.g., which part of
+of the derived dataset, e.g., HDFS data source being indexed, in-
+the plan was modified, which indexes were chosen, why they were
+formation needed to refresh the index with minimal information
+chosen, etc. The whatIf API allows users to provide the indexing
+from the user, information needed to perform index selection, and
+subsystem with hypothetical index configurations and get an expla-
+descriptive history of an index;
+nation of how useful it would be if the indexes in the hypothetical
+•
+State, which captures state pertaining to the derived dataset, e.g.,
+configuration were built. The recommend API allows users to get a
+global information such as Active and Disabled, and transient
+ranked recommendation of indexes that can be built for a workload.
+information such as Creating and Deleted.
+Storage and query optimizer configuration to allow the user
+to override the behavior of the query optimizer and index man-
+4.2
+Index State Management
+agement. For instance, by default, every index that gets created
+Index state management is at the center of serverless index man-
+will be discoverable. If this is not acceptable, the user can choose
+agement for stateful index operations such as index creation and
+private index locations and namespaces to create their indexes and
+deletion. Figure 6 presents the details of the index state transition
+provide hints to the query optimizer so that it will only consider
+diagram under the Hyperspace index manipulation APIs:
+these indexes during query optimization.
+•
+Creating: When a user invokes the Hyperspace create() API,
+4
+INDEX MANAGEMENT
+the index being created enters the Creating state; if the user can-
+cels index creation by issuing the Hyperspace cancel() API, then
+Our primary goal was to implement Hyperspace as a low-cost in-
+the index goes back to the DNE (meaning ‘Do Not Exist’) state.
+dexing subsystem that allows for concurrent index maintenance
+•
+Active: The index has been created successfully and is ready to
+operations on an index that can be leveraged by multiple engines. In
+use. Note that the index is not visible when it is in the Creating
+this section, we start with an important design decision taken to sim-
+state until its state turns to Active.
+plify the implementation, which was to make index management
+•
+Refreshing: A user can refresh an existing index via the Hyper-
+“serverless,” i.e., there is no standalone server (in an Apache Spark
+space refresh() API upon data updates. However, refreshing does
+cluster or more broadly in an Azure Synapse Analytics workspace)
+not block index visibility—readers can keep accessing the current
+dedicated to managing indexes. We achieve this by storing all in-
+active copy of the index until refreshing is finished.
+formation pertaining to the index (e.g., metadata, operations on an
+•
+Restoring: A user can restore an index that has been deleted
+index) in the data lake, and capturing changes to an index through
+via the Hyperspace restore() API. Again, the index is not visible
+an operation log. We discuss how we handle concurrent updates
+when it is in the Restoring state.
+using optimistic concurrency control.
+•
+Deleting: A user can delete an index using the delete() API.
+4.1
+Foundation: Metadata in the Lake
+Recall that deletion in Hyperspace is soft and therefore fast. The
+state of the index moves from Active to Deleted after deletion
+Interoperability is complex as it requires every query engine to
+and the index becomes invisible. Existing readers, however, will
+agree on what constitutes an index; this requires agreement be-
+not be affected, similar to Refreshing. A deleted index can be
+tween developers (and organizations/companies) working in dif-
+vacuumed to free its storage space via the vacuum() API.
+ferent silo-ed ecosystems. Since the latter problem is much harder
+•
+Optimizing: A user can further choose to optimize the index
+in reality, we prioritized finding a low-friction design for exposing
+via the Hyperspace optimize() API. This is an API call reserved
+index-related metadata (e.g., contents, state etc.) in a way that al-
+for incremental refreshing. For example, one optimization is index
+lows for easy integration. Exposing the state of an index or the list
+compaction, where (small) index blocks generated incrementally
+of operations invoked on an index through traditional means, such
+will be merged into larger ones to improve index read efficiency.
+as a catalog service or a transaction manager service, guarantees
+Note that the states in the above list are transitioning, while the
+strong consistency. However, this approach has a few major oper-
+other states Active, Deleted, and DNE are stable.
+ational implications. First, it brings in service dependencies and
+Clearly, some index states conflict with each other. For exam-
+live-site support overheads. Second, it makes integration complex
+ple, if an index state is Deleting, Refreshing, or Optimizing
+since now every new engine has to depend on a third-party service.
+(in one user session), it cannot be Restoring at the same time (in
+Finally, it introduces operational costs of running the service.
+another concurrent user session), because the index can only move
+We decided to trade-off metadata consistency for easier opera-
+to Deleting, Refreshing, or Optimizing from Active whereas
+tional maintenance, i.e., we store the ground truth of information of
+it can only enter Restoring from Deleted (as shown in Figure 6).
+an index in the data lake. Figure 5(a) shows the full specification of
+If two Hyperspace APIs can lead to conflicting index states, then
+the information we store for a given index, and Figure 5(b) provides
+they are incompatible. Table 1 shows the compatibility matrix of Hy-
+a concrete example of an index metadata entry. The specification is
+perspace APIs—incompatible entries are marked with ‘N’ whereas
+divided into the following regions:
+compatible ones are marked with ‘Y.’
+3048
+Sample Non-Clustered Index
+id: 2
+Root
+name: myNonClusteredIndex
+id
+Id of the log operation
+derivedDataset
+Name of the index
+kind: NonClusteredIndex
+name
+derivedDataset
+Information for semantic interpretion of the derived dataset
+version: 0.1
+kind
+Kind e.g., non-clustered index, bloom filter index, stats, views
+properties:
+version
+Version for the specific type
+cols
+Contents
+properties
+Type-specific configuration e.g., indexed/included cols for covering index
+indexed: ["a", "b"]
+content
+Location that contains data pertaining to the derived dataset
+included: ["c"]
+root
+Base path
+schemaddl: "`a` INT, `b` INT, `c` INT"
+directories[]
+Set of locations constituting the snapshot of the derived dataset
+numBuckets: 200, stats: {}
+E
+path
+Specific directory path
+content
+filenames[]
+List of files (for light-weight validation)
+root: /synapse/workspace/john/idx1
+signature
+Signature (for light-weight validation)
+directories[]
+timestamp
+Timestamp when this derived dataset was modified
+path: dir-0
+source
+Encapsulates where and how this derived dataset was constructed
+filenames: [1,2,3]
+plan
+Serialized representation of the plan that produced this derived dataset
+signature: xy61726zaqw
+kind
+The engine that produced this plan e.g., Spark, Polaris
+timestamp: 2019-12-12 00:00:00
+Lineage
+version
+Version for the specific engine
+source
+properties
+Engine specific properties e.g., logicalPlan, signature
+plan
+E
+data[]
+Description of the sources used for deriving this derived dataset
+kind: Spark
+kind
+version: 0.1
+The type of this data source e.g., HDFS, SQL Server
+properties
+version
+Version for the specific source type
+=
+properties
+Data source specific properties e.g., HDFS
+[path, files, signature]
+rawPlan: base64Plan
+Current state of the entity e.g., CREATING, ACTIVE etc.
+signature: md5Hash(base64Plan)
+state
+data[]
+State
+enabled
+Flag indicating whether the optimizer can exploit this entity
+kind: Hdfs
+extra
+Extra fields for future use
+version: 0.3.1
+specVersion
+Version of this specification
+properties
+directories[]
+path: dirLocation1
+t
+filenames[]: [f1,f2,f3, ...]
+...
+...
+...
+...
+...
+...
+Operation Log
+signature: md5Hash(fileProps)
+state: Active
+(a)
+(b)
+Figure 5: (a) Specification for a single metadata entry of a derived dataset (e.g., non-clustered index); (b) Sample index entry.
+create()
+Creating
+Empty/DNE
+done
+cancel()
+LogOp()
+Restoring
+restore()
+done
+Verify expected state,
+cancel()
+vacuum()
+Validate()
+semantic checks
+x
+delete()
+Commit Protocol
+No-Op
+Deleted
+Active
+Deleting
+cancel()
+done
+write id.temp
+Begin()
+Create <id=latest+1>
+refresh()
+w/ transitioning state
+atomic rename
+x
+done
+Refreshing
+Requires cancel()
+id.temp
+id
+cancel()
+RunOp()
+.....
+Run specified operation
+(e.g., index creation)
+Next Op
+Abort
+optimize()
+Optimizing
+f()/f()
+Public API
+(success)
+(failure)
+Transient state
+x
+Requires cancel() + cleanup()
+Stable state
+done
+DNE
+Does Not Exist
+Create <id=latest+1>
+Figure 6: Index State Machine
+Commit()
+w/ final stable state
+API
+C
+D
+O
+RF
+RS
+V
+Figure 7: Log Operation
+C
+Y
+N
+N
+N
+N
+N
+•
+Begin(), which assigns an id to the index manipulation with
+D
+N
+Y
+Y
+Y
+N
+N
+the corresponding transitioning state;
+O
+N
+Y
+Y
+Y
+N
+N
+•
+RunOp(), which records that the manipulation is now running;
+RF
+N
+Y
+Y
+Y
+N
+N
+•
+Commit(), which records the id of the finished index manipula-
+RS
+tion with the corresponding final stable state.
+N
+N
+N
+N
+Y
+N
+V
+N
+N
+N
+N
+N
+Y
+Hyperspace relies on the atomicity of renaming a file in a cloud
+Table 1: Compatibility matrix of Hyperspace index APIs: (1)
+file system (including HDFS, Azure Storage, or Azure Data Lake)
+‘C’ for ‘create’, (2) ‘D’ for ‘delete’, (3) ‘O’ for ‘optimize’, (4) ‘RF’
+to ensure that altering index state from a transitioning state to a
+for ‘refresh’, (5) ‘RS’ for ‘restore’, and (6) ‘V’ for ‘vacuum’.
+stable state during Commit() is atomic. If during Commit() Hy-
+Multi-user Concurrency Control
+perspace detects that the corresponding file that stores the index
+4.3
+transitioning state has been renamed, Hyperspace can simply abort
+Hyperspace allows multiple users to manipulate the same index
+the ongoing index manipulation. The user can choose to retry the
+simultaneously. Hyperspace ensures the correctness of the index
+index manipulation upon receiving an abort message.
+(based on the index state transition diagram in Figure 6) using
+Hyperspace currently supports multiple writers using the above
+optimistic concurrency control. In the following, we provide a brief
+concurrency control mechanism, and multiple readers. Readers sim-
+overview of the Hyperspace concurrency model.
+ply choose a stable snapshot of the index data that has been commit-
+We employ the operation log depicted in Figure 5(a) that supports
+ted. To ensure consistency between the index and the corresponding
+the following log operations (Figure 7):
+data being indexed, Hyperspace further employs a signature-based
+•
+LogOp(), which simply records the index manipulation (by a
+mechanism (see Figure 5(a)) where the latest timestamps of the
+single user) that is going to happen;
+data files are used to generate a signature for the index. During
+•
+Validate(), which validates whether the index is in a suitable
+query processing (see Section 6), it is possible that a query may
+state that allows for the desired manipulation (e.g., one cannot
+touch a table as well as its indexes simultaneously. Using the signa-
+delete an index that does not exist);
+ture of the data that is stored in the index metadata, the optimizer
+3049
+can ensure that the index is not stale. However, ensuring external
+typically used by customers who capture snapshots of their data in
+consistency remains as a challenge, as Hyperspace is a serverless
+the data lake. In these cases, the underlying data is entirely rewritten
+indexing service that does not manage the data. For example, it is
+to the point where incremental indexing is not very beneficial (as
+possible that a query is accessing data that has been updated since it
+it anyways rewrites the entire index).
+validated the consistency of the index, as Hyperspace does not hold
+any lock over the data during query execution. External consistency
+Incremental Refresh. If the user is infrequently appending/delet-
+is beyond the scope of functionalities that Hyperspace currently
+ing large amounts of data to the underlying source, it is beneficial
+supports. Some coordination mechanism across data lake users is
+to use the incremental refresh mode, where Hyperspace operates as
+required to ensure external consistency. One naive approach could
+follows. First, Hyperspace scans the underlying source and records
+be to enforce that each user has their own workspace and cannot
+the list of appended and deleted files/partitions by comparing it
+access other users’ workspaces. This prevents inconsistency but
+against the lineage information recorded in its metadata (recall that
+also restricts any possible data sharing.
+Hyperspace stores the filename, last modified timestamp and file
+size at the time of index creation). Second, for the appended files,
+5
+INCREMENTAL INDEX MAINTENANCE
+Hyperspace starts an indexing job to sort only that portion of the
+Hyperspace enables index maintenance over mutable datasets re-
+data. To handle deletes, it utilizes index lineage to detect which
+gardless of the underlying data format. In this section, we discuss
+portions of the data these affected index blocks were generated
+the use cases and incremental index maintenance features.
+from and simply rewrites those index blocks. Third, all the new
+index blocks are committed as a new incremental version of the
+5.1
+Mutable Datasets and Semantics
+index. Finally, the metadata is updated to reflect the latest snapshot.
+Enterprise datasets get modified over time. The following are com-
+Quick Refresh. If the user frequently appends small amounts of
+mon patterns we have observed with our customers:
+data to the underlying source, it may not be cost-efficient to keep
+(1) Streaming ingestion. Teams that need to deploy data stream-
+running indexing jobs since the benefit from partially sorting this
+ing pipelines [41, 64] would collect data into data lakes parti-
+newly added data may be negligible. For such cases, Hyperspace
+tioned by a certain key, e.g., timestamp, writer-id, etc. This data
+supports a quick refresh mode where it simply scans for the list
+is then consumed by downstream pipelines and modified to fit
+of files appended/deleted and updates the metadata to capture this
+their needs. More frequently, a number of users query these
+information. At query time, Hyperspace resorts to its hybrid scan
+raw datasets in ways that force linear scans.
+operator (see Section 6.2) to derive the latest index.
+(2) GDPR Compliance. To comply with data privacy regulations
+such as GDPR [42], enterprises have to delete data correspond-
+Optimize. If a user invokes incremental or quick refresh too often,
+ing to a particular user, when requested to do so (typically
+the index may get fragmented (similar to indexes in traditional
+through features like Forget-Me [42]).
+DBMS systems). To handle this scenario, Hyperspace allows users
+(3) Data corrections. Data may need to be updated due to errors
+to optimize their indexes by compacting smaller index files based
+in data collection or late-arriving data or simply user satisfac-
+on user-provided criterion (e.g., compact files less than 10 MB).
+tion (e.g., in cases where users are charged due to a software
+bug, it is typical in cloud providers to issue refunds).
+5.3
+Support for ACID Data Formats
+An inherent complexity inside Hyperspace is caused by the mecha-
+Typically, each data team has their own mechanisms to apply these
+nisms to determine if the underlying data source is up-to-date and if
+updates to data lake datasets ranging from maintaining custom
+it is not, determining what changed since the time the data source
+secondary indexes to blobs that are then used to update appropriate
+was indexed. Recent systems such as Linux Foundation’s Delta
+portions to using more recently introduced ACID table formats [27,
+Lake [30], Apache Hudi [27], and Apache Iceberg [28] have defined
+28, 30]. Since in-place update semantics are not so common [11],
+data formats and access protocols to implement transactional oper-
+nearly all solutions to handling updates use some form of journaling
+ations on cloud object stores. These systems maintain a transaction
+(e.g., versioning, delete-and-append, etc.).
+log that records all operations that have taken place on the data
+being managed. When indexing such data formats, Hyperspace
+5.2
+Index REFRESH & OPTIMIZE
+can exploit the respective transaction logs to skip some expensive
+Hyperspace captures detailed metadata of the underlying data
+metadata checks. For instance, when Hyperspace is indexing data in
+source at the time it indexes them. This includes information such
+Delta Lake format, it relies on the latter’s transaction log to quickly
+as filename, modified time, and file size. While appends to original
+obtain the list of partitions/files that have been added/removed and
+datasets can be supported without any special metadata, to handle
+updates the Hyperspace log appropriately.
+deletes, users need to create an index with lineage tracking enabled
+that tracks which source file a particular record originates from.
+6
+QUERY PROCESSING USING INDEXES
+To accommodate a variety of enterprise workloads, Hyperspace
+supports multiple index maintenance modes captured in Table 2.
+During query optimization, Hyperspace explores potential benefits
+of leveraging indexes by making the query optimizer “index-aware.”
+Full Refresh. The simplest mode is a full rebuild of the index that
+For example, for the case of Apache Spark, Hyperspace has incorpo-
+re-scans the original data to build a new version of the index. This is
+rated new optimizer rules into Catalyst — Spark’s rule-based query
+particularly efficient if the underlying source data is relatively stable
+optimizer [23]. In this section, we present the design and implemen-
+and the index is being heavily used. We observed this mode being
+tation of this “index-aware” query optimizer extension. We also
+3050
+Full Rebuild
+Quick Query
+Fast Refresh
+Append
+Characteristic
+Slowest refresh/fastest query
+Slow refresh/fast query
+Fast refresh/moderately fast query
+API
+refreshIndex(mode="full")
+refreshIndex(mode="incremental")
+refreshIndex(mode="quick")
+What it does?
+Rebuilds the index
+Builds index on newly added data
+Captures metadata for appended
+files and leverages hybrid scan
+When to use?
+Underlying source data is
+Infrequently appending large
+Frequently appending small
+relatively stable
+amounts of data
+amounts of data
+Delete
+Characteristic
+Creates a new index (by
+reshuffling the source data)
+Slow refresh/fast query
+Fast refresh/moderately fast query
+API
+refreshIndex(mode="incremental")
+refreshIndex(mode="quick")
+What it does?
+Drops rows from index immediately; Avoids
+Captures file/partition predicates
+shuffling the source data using index lineage
+and deletes entries at query time
+When to use?
+Infrequently deleting large
+Frequently deleting small
+amount of data
+amounts of data
+Optimize
+Faster Optimize Speed
+Slower Optimize Speed
+API
+optimizeIndex(mode="quick")
+optimizeIndex(mode="full")
+Best-effort merge of small index files
+Create a single file per partition
+What it does?
+within a partition;
+by merging small & large files;
+DOES NOT refresh the index
+DOES NOT refresh the index
+When to use?
+When perf starts degrading
+When perf starts degrading
+Table 2: Index maintenance modes. Since workloads vary by requirements, Hyperspace supports multiple index maintenance
+mechanisms to allow customers to choose the options that will help them meet their business SLAs.
+propose hybrid scan, a novel access path that allows Hyperspace to
+Hyperspace
+Input
+Best Query Plan
+Indexes
+(with lowest cost)
+utilize an index for query processing even if it is not up to date.
+Query Plan
+A
+4
+6.1
+Index-aware Optimizer Extension
+Query Plan Optimization
+Plan Ranker
+6.1.1
+A Generic Framework. Figure 8 presents the architecture of
+the query optimizer extension made by Hyperspace. The input
+Index Strategies
+"What If" Utility
+to optimizer is now the query and the set of available candidate
+Covering
+Non-Covering (Partitions)
+Cost Model
+indexes. The optimizer then considers all indexes from the given
+Non-Covering (Bloom Filter)
+candidates that could be utilized to accelerate query performance
+Stat Collection
+to select the best ones. To fulfill this, Hyperspace employs index
+Figure 8: Hyperspace query optimizer extension
+strategy to perform index selection. The index strategies are cus-
+Indexing Rule for Joins. The JoinIndexRule works in a similar
+tomized for different query optimizers, and we will present their
+manner by looking for candidate indexes via pattern matching.
+implementations in Apache Spark shortly. After applying the index
+However, unlike the FilterIndexRule, we are not able to match
+strategies, the resulting query plans (with indexes) are sent to the
+a specific pattern except for merely matching individual join op-
+plan ranker, which will compare/rank the plans and pick the best
+erators. We then examine that for each matched join operator, it
+one (e.g., with the lowest execution cost). The estimation of the
+satisfies the equi-join condition, i.e., the join condition is restricted
+execution cost of a plan is delegated to a component called “what
+to be a conjunction of equality predicates between join columns.
+if” utility that is shared with the index recommender. The “what
+After matching an eligible join operator O with join condition c,
+if” utility [21] is an extended version of the usual query optimizer
+the next step is to find usable indexes for O. Given that both the
+cost model that takes index access costs into consideration. It can
+left and right sub-plans are linear, we only have two base tables
+take both actual indexes (as in Figure 8) and hypothetical indexes
+in the plan tree under O. For each base table T , we then check the
+as in the context of index recommendation [20].
+following conditions for each candidate index I on top of T :
+•
+6.1.2
+Hyperspace Index Strategies in Spark. Since Catalyst is a rule-
+All join columns in T that are referenced by c should be the same
+as the indexed columns of I;
+based query optimizer, Hyperspace implements two index strategies
+•
+as optimizer rules, FilterIndexRule and JoinIndexRule, that tar-
+All other columns referenced by the left or right sub-plan that
+get accelerating filter and join operators in Spark query execution
+accesses T are contained by the included columns of I.
+plans using Hyperspace indexes. Hyperspace indexes may also be
+Let Il and Ir be the candidate indexes found for the left and right
+beneficial for other operators, such as aggregates on top of group-
+sub-plan, respectively. If more than one index pair (I
+l
+, Ir ) ∈ (Il
+, Ir )
+bys, which could be interesting directions for future work.
+exists, Hyperspace currently picks the one that would result in the
+least execution cost based on the following criteria:
+Indexing Rule for Filters. The FilterIndexRule works as follows.
+(1) If there exist index pairs (I
+l
+, Ir ) such that I
+l and Ir have the
+If a table scan has a filter f on top of it, we replace it by a Hyperspace
+same number of partitions, then pick the index pair with the
+index I if the following conditions meet:
+largest number of partitions.
+•
+The leading column in the indexed (key) columns of I is refer-
+(2) Otherwise, if no such index pair exists, then pick an arbitrary
+enced by some predicate in f ;
+index pair from the eligible pairs.
+•
+All columns referenced by predicates in f are covered by I, i.e.,
+The rationale is the following. First, when two indexes have the
+appear in either the indexed or included columns of I.
+same number of partitions, there is no shuffling when performing
+We implement the condition checking using pattern matching [8].
+the (sort-merge) join; if the number of partitions differ, one index
+3051
+gets reshuffled into the number of partitions equal to the other.
+Compute Cluster Settings
+Second, in general more number of partitions can lead to better
+Type
+Nodes
+VM
+Cores
+RAM
+SSD
+parallelism in join execution, assuming no resource constraint.
+Driver
+2
+D12V2
+8
+28 GB
+200 GB
+Finally, JoinIndexRule replaces table scans with corresponding
+Worker
+16
+D14V2
+256
+112 GB
+800 GB
+index scans on top of the best index pairs found.
+Storage Settings
+6.2
+Hybrid Scan
+Type
+WASB Storage (general purpose v1)
+Since refreshing an index is modeled as an indexing job (so it can
+Repl
+Locally-redundant storage replication (LRS)
+scale), it may not always be beneficial to keep running refresh jobs
+Table 3: Compute and storage characteristics
+(e.g., when only a small amount of data is appended/deleted). How-
+Support of “Time Travel”. As described in Section 5.3, Hyperspace
+ever, if an index is not refreshed, Hyperspace will detect that the
+supports ACID data formats such as Linux Foundation’s Delta
+index has gone stale since the underlying data has changed. For
+Lake [30]. An interesting feature offered by such data format is the
+most of our customers, this was quite unreasonable (in fact, some
+ability to “time travel,” i.e., users can query point-in-time snapshots
+have asked that we allow using a stale index as it provides sig-
+or roll back erroneous updates to their data. Time travel brings
+nificant acceleration). To circumvent these problems, Hyperspace
+interesting challenges to index management. For instance, during
+provides hybrid scan that allows users to leverage indexes even
+optimization, Hyperspace should be able to detect that version of the
+when they have gone stale.
+underlying dataset that is being queried and should decide the best
+index to use (recall that Hyperspace supports multiple snapshots
+of indexes, i.e., every time the user invokes a full refresh, there is
+Timeline
+1
+v1
+Initial dataset
+{1,2,3,4,5,6}
+a new version of the index that is generated). Hybrid scan forms
+2
+v2
+Index created
+{1,2,4,5,6}
+the core backbone for supporting data formats offering time travel.
+v3
+Dataset updated
+{1,2,5,6,7,8}
+3
+X
+X
+User queries dataset @v3
+Once the best index is determined, Hyperspace utilizes hybrid scan
+4
+(1): Compute diff since indexed
+to reconstruct the latest state by comparing the transaction logs.
+X
+[{4, deleted}, {7, added}, {{8, added}]
+5
+(2): Rewrite Table Scan as Hybrid Scan
+6
+a
+a
+d
+a
+a
+a
+a
+Dataset
+-
+=
+v1
+-o-
+v2
+v3
+v4
+v5
+v6
+v7
+7
+Delta Lake
+-o-
+-0
+-O-
+oo
+Table A
+Table B
+∪
+Table B
+H
+8
+σfile != 4
+r
+r
+Shuffle
+v1
+v2
+v3
+v1
+v2
+v3
+Index Scan
+7 8
+Hyperspace
+-O
+-O-
+1
+2 4 5 6
+Figure 9: Hyperspace Hybrid Scan. ⋃︁
+H is a special partition-
+User queries snapshot @ v4
+User queries snapshot @ v6
+Hyperspace chooses:
+Hyperspace compares:
+aware physical union operator implemented in Hyperspace.
+Index(v1) + Scan(DeltaLake(v4 - v2))
+Index(v2) + Scan(DeltaLake(v6 - v5))
+-
+-
+Index(v3) + Scan(DeltaLake(v6 - v7))
+-
+Legend: a - append; d - delete; r - index refresh
+The key idea behind the hybrid scan technique is to utilize the
+existing index and then apply the changes observed in the under-
+Figure 10: Hyperspace support for Time-travel Queries.
+lying data source. At query time, if Hyperspace detects that the
+Since multiple index snapshots can be used, Hyperspace
+index has gone stale, it first obtains a list of files/partitions that
+compares the cost of hybrid scan over those snapshots.
+have been appended/deleted from the underlying data source. Next,
+Figure 10 shows an example of how Hyperspace co-exists with
+it modifies the query plan to exclude the deleted rows and “merge”
+ACID data formats. In formats like Delta Lake, every time a user
+the appended data in the following way (see Figure 9):
+appends (denoted by a) or deletes (denoted by d) files, a new version
+•
+Handling Appends. Since indexes are hash partitioned, any newly
+is created. Subsequently, user can specify the version of the dataset
+appended files should be partitioned the same way and then merged
+they want to time-travel to during query time. When Hyperspace
+(i.e., union-ed) with the existing index data to avoid a full shuffle. To
+is enabled, it determines the list of indexes that are applicable to
+do this, we introduce a new partition-aware union operator, which
+this Delta Lake source and relies on simple cost comparisons (e.g.,
+detects that the two sides are partitioned, sorts within partitions,
+number of files linearly scanned for a specific index version) to pick
+and performs a merge. Note that the sort is cheap since data is
+the best index. For instance, if the user queries the data snapshot v4,
+mostly sorted and we use Timsort [16], which has linear running
+Hyperspace has only one option whereas if they choose to query
+time for mostly sorted data.
+snapshot v6, Hyperspace performs the appropriate cost comparison
+•
+Handling Deletes. Since we capture lineage information in in-
+between using its own index at v2 and v3.
+dexes (i.e., which file a particular row originates from), the hybrid
+7
+EVALUATION
+scan operation can modify the query plan to introduce a filter that
+eliminates all rows belonging to the files that have been deleted.
+We evaluate the performance of Hyperspace using both industry
+While hybrid scan allows users to exploit stale indexes, its perfor-
+benchmarks and real customer workloads. We start by discussing
+mance is dependent on the extent of staleness of the index, i.e., if the
+index creation time, present the gains achieved for queries over
+underlying dataset has undergone too many changes, hybrid scan
+each of the datasets, and finally study the utility of indexes.
+might end up causing regressions. To alleviate this issue, we have
+7.1
+Experimental Environment
+user-configurable properties that allow the optimizer to disable
+We present results obtained using Apache Spark [15, 66] for both
+hybrid scan when the staleness has exceeded a certain threshold.
+index creation and utilization. Our experimental setup has a combi-
+We leave automatically determining this aspect to future work.
+nation of D12V2 and D14V2 instances in Azure. The details of the
+3052
+2.0
+2
+dataset
+tpcds
+tpch
+7.5
+1.5
+5.0
+1.0
+1
+2.5
+Baseline=1.0
+0.5
+Baseline=1.0
+0
+0.0
+0.0
+Time (hours)
+Average Gain
+Average Gain
+50
+100
+200
+400
+800
+50
+200
+500
+1k
+2k
+10k
+20k
+50k
+100k
+50
+100
+200
+400
+800
+# cores used for index
+# chunks in the underlying
+# cores reading the
+creation on a 1 TB dataset
+base table (Parquet format)
+fixed number of index chunks
+(a)
+(b)
+(c)
+Figure 11: (a) Index creation time; (b) Performance gains on TPC-H with respect to increasing number of base table chunks; (c)
+Performance gains on TPC-H with respect to fixed number of index partitions (i.e., 200) and increasing number of CPU cores.
+Dataset
+CSV
+Parquet
+Index
+Index
+(TPC-H Q6) It scans the lineitem table, applies range selection
+Size
+Size
+Count
+Size
+predicates on l_shipdate, l_discount, and l_quantity, and
+TPC-H
+1.2 TB
+391 GB
+16
+691 GB
+performs an aggregation on a projection of a few columns to calcu-
+TPC-DS
+1.0 TB
+510 GB
+37
+1315 GB
+late revenue. When scanning lineitem, Spark pushes all predicates
+Customer
+60 GB
+18 GB
+13
+52 GB
+down into the Parquet file reader. Without Hyperspace indexes, the
+Table 4: Dataset and Hyperspace index characteristics
+pushed-down filters are ineffective as Spark has to fetch all row
+memory and storage configuration of each of these VM instances
+groups, as the records are randomly arranged in Parquet files. With
+are provided in Table 3; D12v2 instances power the job submission
+Hyperspace, Spark can use an index on l_shipdate that helps
+endpoint while D14v2 instances are used for running the Spark
+skip fetching more than 67% of data, resulting in 2x to 3x speedup.
+driver and workers. We store all our datasets on Azure Storage
+(WASB [11]) configured for locally-redundant storage (LRS) replica-
+(TPC-H Q17) The lineitem table is first filtered and aggregated
+tion. We pre-generated data for two standard industry benchmarks,
+to find average l_quantity per l_partkey (AGG). It then joins
+TPC-H (22 queries) [10] and TPC-DS (99 queries) [9], and a real-
+lineitem with filtered part on l_partkey and p_partkey (JOIN).
+world customer workload Customer (15 queries). Compared to
+The results are further joined with filtered AGG results on part_key.
+TPC-H and TPC-DS, the Customer workload is relatively sim-
+Spark chose to use a shuffled hash-join for JOIN; as a result the tables
+ple as its’ queries contain fewer joins. For all datasets, we also
+need to be shuffled on l_partkey and p_partkey. Although the fil-
+pre-generate the necessary indexes output by our index recom-
+ter on part is highly selective, all records of lineitem – the largest
+mendation engine. The details of these datasets along with their
+table – are shuffled (179 GB). AGG computation is done through
+index configurations are provided in Table 4. We run each query
+hash aggregation, which includes shuffling partially aggregated
+five times consecutively, discard the first iteration (to warm up the
+lineitem records on l_partkey before the global aggregation.
+storage cache), and average the remaining runs.
+This is another large shuffle (168 GB) during query execution. With
+Hyperspace, for both AGG and JOIN Spark exploits Hyperspace
+7.2
+Index Creation Time
+indexes on lineitem and part to eliminate the shuffles.
+We begin by answering the simplest question raised by the majority
+7.4
+Hybrid Scan
+of our customers: How long does it take to create Hyperspace indexes?
+While Hyperspace supports incremental refresh, one of the most
+Figure 11(a) shows the index creation time for TPC-H (16 indexes)
+popular customer requests has been to allow exploiting indexes to
+and TPC-DS (50 indexes) when varying the numbers of CPU cores.
+the extent possible. However, allowing stale indexes will lead to
+The indexes are selected based on the index recommendation com-
+correctness issues in production and unexpected complaints from
+ponent of Hyperspace. An index creation job reads the underlying
+customers who may not fully understand why they are being served
+base tables, performs any necessary projections and shuffles, and
+results from stale indexes. To address this, Hyperspace implements
+sorts the output based on the key columns determined by the index
+hybrid scan that allows exploiting a stale index to the extent possible
+recommendation algorithm. Based on the results, we observe a
+and then adjusts for any appends/deletes to the underlying datasets.
+linear speedup with increasing number of CPU cores.
+By far, the most frequently asked question was: is hybrid scan
+We note that index creation remains an area in Hyperspace
+performant? how can one understand its characteristics?.
+that is worth further improvement, since it requires scanning the
+We study these question by simulating a real-world customer
+underlying table once, repartitioning/shuffling the data based on
+workload. Our customer has a large table into which they stream
+the indexed columns (for generating the buckets), and then writing
+updates (which include appends and deletes). Deletes are quite in-
+the index to cloud storage (Azure Storage in our case). We leave
+frequent (few batches a day) but appends are frequent (thousands of
+this as one interesting direction for future work.
+files being added into the dataset daily). To simulate this workload,
+7.3
+Query Execution Performance
+we use the lineitem from TPC-H as the large table and run all the
+22 queries as we continue to maintain (i.e., append/delete) it. As
+Figure 12 shows the gain achieved for each query from the three
+we perform this experiment, there are four situations to consider:
+workloads. Overall, we observe gains of 75.0% for TPC-H, 50.6% for
+our baseline performance without indexes, performance with partial
+TPC-DS, and 89.9% for Customer when the underlying datasets
+indexes (i.e., since the dataset was updated, Hyperspace will inval-
+are in CSV format, and 39.8% for TPC-H, 50.5% for TPC-DS, and
+idate any indexes built on lineitem), performance with hybrid
+43.6% for Customer when the underlying base table datasets are in
+scan, and finally, performance with indexes fully refreshed.
+Parquet format. We now deep dive into two representative TPC-H
+Figure 13 shows the performance of hybrid scan in comparison
+queries to explain where the gains come from.
+to the baseline, partial indexes, and fully up-to-date indexes. Each
+3053
+format
+parquet
+csv
+format
+parquet
+csv
+format
+csv
+parquet
+12
+10.0
+7.5
+40
+8
+5.0
+20
+4
+2.5
+Average Gain
+Average Gain
+Average Gain
+Baseline=1.0
+0
+Baseline=1.0
+Baseline=1.0
+Baseline=1.0
+Baseline=1.0
+Baseline=1.0
+0.0
+0
+0
+5
+10
+15
+20
+0
+25
+50
+75
+100
+0
+5
+10
+15
+TPC−H Query
+TPC−DS Query
+Customer Query
+(a)
+(b)
+(c)
+Figure 12: Average gain for (a) 1 TB TPC-H workload; (b) 1 TB TPC-DS workload; (c) Customer workload.
+Category
+multi-dimensional range filtering predicates. by requiring that the
+Fully Up−to−date Indexes
+Hybrid Scan
+Partial Stale Indexes
+table itself be re-organized. Hyperspace instead supports Z-Order
+6
+secondary indexes [43] which allows users to build several such in-
+4
+dexes for different query patterns. Needless to say, this would raise
+new challenges in index recommendation when choosing between
+2
+Z-order and other types of indexes. Moreover, our incremental
+index maintenance and hybrid query processing mechanisms are
+Baseline=1.0
+Normalized Gain
+Baseline=1.0
+0
+inspired from Helios [52], which targets indexing massive data
+(100k, 50k, 0) (50k, 200, 0)
+(55k, 5k, 0)
+(75k, 25k, 0) (99.9k, 0, 100) (99k, 0, 1k)
+Scenario (#files in base dataset, #files appended, #files deleted
+Figure 13: Efficiency of Hyperspace’s Hybrid Scan
+injected into the cloud from the edge in a timely manner.
+In the context of Spark, recent work by Uta et al. [62] showcases
+of the tuples of the form (a, b,c) in the x-axis denotes the number
+the use of in-memory cTrie indexes [53] to accelerate graph process-
+of files in the base dataset, number of files appended and deleted
+ing queries. GeoSpark [65] considers indexing support (e.g., R-tree,
+respectively. Since the base dataset contains a large number of files,
+quad-tree, and KDB-tree) for querying spatial data. Hyperspace is
+Hyperspace offers significant acceleration (as high as 5x) as can
+in many ways complementary to these efforts in that we are not
+be observed from the fully up-to-date indexes bar. Notice, however,
+proposing new index structures but an extensible framework that
+that the performance of partial indexes approaches the baseline
+can support these different types of indexes.
+since Hyperspace is unable to utilize the most valuable indexes.
+There have also been various other techniques that aim for ac-
+There are several observations one can make from the performance
+celerating query performance in big data and/or data lake sys-
+of hybrid scan. First, when the number of updates is small relative
+tems. For example, data partitioning and partition pruning [40, 49],
+to the number of files in the base dataset, e.g., (50k, 200, 0), (99.9k,
+data shuffling [54], as well as materialized views and view selec-
+0, 100), and (99k, 0, 1k), the performance of hybrid scan is close
+tion [35, 36]. Hyperspace is complementary to these technologies
+to that obtained using fully refreshed indexes. The performance
+by focusing on the indexing and index management aspect. There
+starts deteriorating when the number of files appended starts in-
+has also been much work devoted to polystores [25] in recent years
+creasing significantly, as in the case of (75l, 25k, 0). In the worst
+where data is located on multiple heterogeneous data stores, where
+case, e.g., more than 50% data got appended as in (100k, 50k, 0), the
+cross-platform query processing techniques have been developed
+performance approaches that of the partial indexes (but still better).
+(e.g., [12, 38]). It will be interesting to see how Hyperspace indexes
+could be further applied in polystore scenarios given that Hyper-
+8
+RELATED WORK
+space was designed with multi-engine use cases in mind.
+Indexing is a standard performance acceleration technique in clas-
+9
+CONCLUSION
+sic database systems. Examples include tree-based techniques (e.g.,
+B-tree [22], LSM tree [50], R-tree [31], quad-tree [58]), hash-based
+We have presented Hyperspace [43, 44, 55, 56], the indexing sub-
+techniques (e.g., extendible hash [26], linear hash [39]), and bitmap-
+system of the Azure Synapse Analytics service from Microsoft. In
+based techniques [48], among others. In the past decade, column-
+the spirit of heterogeneity in data lakes, our goal is to democra-
+stores [60] have become increasingly popular, especially for read-
+tize indexes and their management by storing all index-related
+heavy OLAP workloads. Major database vendors such as Microsoft
+data/metadata in the lake, allowing users to reuse them across mul-
+SQL Server [6] now provide column-stores as an alternative index-
+tiple engines. We discussed Hyperspace’s indexing infrastructure,
+ing technique in addition to traditional ones, e.g., B+ tree or hash
+its incremental maintenance mechanisms, and its query processing
+indexes. Our design of Hyperspace indexes is inspired from both
+architecture. We presented evaluation results that show it improves
+traditional and column-store indexes, with adaptations to big data
+query execution by 2x to 10x for complex workloads. Compared to
+query processing systems (e.g., partitioning on indexed columns).
+existing indexing technologies in the big data world, Hyperspace
+Indexing support in modern big data systems remains limited,
+offers not only query performance acceleration but also an auto-
+especially for OLAP-style data analytics workloads. Recently, Delta
+mated lifecycle management framework that significantly improves
+Lake [14] proposed using Z-order [47] to optimize for queries with
+user experience related to index usage.
+3054
+REFERENCES
+[36] Alekh Jindal, Shi Qiao, Hiren Patel, Zhicheng Yin, Jieming Di, Malay Bag, Marc
+[1] [n.d.]. Apache Parquet. https://parquet.apache.org/.
+Friedman, Yifung Lin, Konstantinos Karanasos, and Sriram Rao. 2018. Computa-
+[2] [n.d.]. Azure Synapse Analytics. https://azure.microsoft.com/en-us/services/
+tion Reuse in Analytics Job Service at Microsoft. In SIGMOD. 191–203.
+synapse-analytics/.
+[37] Jan Kossmann, Stefan Halfpap, Marcel Jankrift, and Rainer Schlosser. 2020. Magic
+[3] [n.d.]. Bucketing in Spark. https://jaceklaskowski.gitbooks.io/mastering-spark-
+mirror in my hand, which is the best in the land? An Experimental Evaluation of
+sql/spark-sql-bucketing.html.
+Index Selection Algorithms. Proc. VLDB Endow. 13, 11 (2020), 2382–2395.
+[4] [n.d.]. Deep Dive into GPU Support in Apache Spark 3.x. https://databricks.com/
+[38] Jeff LeFevre, Rui Liu, Cornelio Inigo, Lupita Paz, Edward Ma, Malú Castellanos,
+session_na20/deep-dive-into-gpu-support-in-apache-spark-3-x.
+and Meichun Hsu. 2016. Building the Enterprise Fabric for Big Data with Vertica
+[5] [n.d.]. FPGA-Based Acceleration Architecture for Spark SQL. https://databricks.
+and Spark Integration. In SIGMOD. 63–75.
+com/session/fpga-based-acceleration-architecture-for-spark-sql.
+[39] Witold Litwin. 1980. Linear Hashing: A New Tool for File and Table Addressing.
+[6] [n.d.]. Microsoft SQL Server Columnstore Indexes. https://docs.microsoft.com/en-
+In VLDB. 212–223.
+us/sql/relational-databases/indexes/columnstore-indexes-overview?view=sql-
+[40] Yi Lu, Anil Shanbhag, Alekh Jindal, and Samuel Madden. 2017. AdaptDB: Adaptive
+server-ver15.
+Partitioning for Distributed Joins. Proc. VLDB Endow. 10, 5 (2017), 589–600.
+[7] [n.d.]. Parquet MR. https://github.com/apache/parquet-mr.
+[41] Luo Mai, Kai Zeng, Rahul Potharaju, Le Xu, Steve Suh, Shivaram Venkataraman,
+[8] [n.d.]. Scala Pattern Matching. https://docs.scala-lang.org/tour/pattern-matching.
+Paolo Costa, Terry Kim, Saravanan Muthukrishnan, Vamsi Kuppa, et al. 2018. Chi:
+html.
+A scalable and programmable control plane for distributed stream processing
+[9] [n.d.]. The TPC-DS Benchmark. http://www.tpc.org/tpcds/.
+systems. Proceedings of the VLDB Endowment 11, 10 (2018), 1303–1316.
+[10] [n.d.]. The TPC-H Benchmark. http://www.tpc.org/tpch/.
+[42] Microsoft. 2017. GDPR Compliance. https://goo.gl/2KkwMv (2017).
+[11] [n.d.]. Windows Azure Storage Blob (WASB). https://gerardnico.com/azure/wasb.
+[43] Microsoft. 2020. Hyperspace. https://github.com/microsoft/hyperspace.
+[12] Divy Agrawal, Sanjay Chawla, Bertty Contreras-Rojas, Ahmed K. Elmagarmid,
+[44] Microsoft. 2020. Hyperspace in Azure Synapse Analytics. https://aka.ms/synapse/
+Yasser Idris, et al. 2018. RHEEM: Enabling Cross-Platform Data Processing - May
+hyperspace.
+The Big Data Be With You! - . Proc. VLDB Endow. 11, 11 (2018), 1414–1427.
+[45] Microsoft. 2020. Time Series Insights. https://azure.microsoft.com/en-us/services/
+[13] Josep Aguilar-Saborit, Raghu Ramakrishnan, Krish Srinivasan, Kevin Bocksrocker,
+time-series-insights/.
+Ioannis Alagiannis, Mahadevan Sankara, Moe Shafiei, Jose Blakeley, Girish
+[46] Guido Moerkotte. 1998. Small Materialized Aggregates: A Light Weight Index
+Dasarathy, Sumeet Dash, et al. 2020. POLARIS: the distributed SQL engine
+Structure for Data Warehousing. In VLDB. 476–487.
+in azure synapse. Proceedings of the VLDB Endowment 13, 12 (2020), 3204–3216.
+[47] G. M. Morton. 1966. A computer oriented geodetic data base; and a new technique
+[14] Michael Armbrust, Tathagata Das, Sameer Paranjpye, Reynold Xin, Shixiong
+in file sequencing. IBM Technical Report (1966).
+Zhu, Ali Ghodsi, Burak Yavuz, Mukul Murthy, Joseph Torres, Liwen Sun, Peter A.
+[48] Patrick E. O’Neil and Dallan Quass. 1997. Improved Query Performance with
+Boncz, Mostafa Mokhtar, Herman Van Hovell, Adrian Ionescu, Alicja Luszczak,
+Variant Indexes. In SIGMOD. 38–49.
+Michal Switakowski, Takuya Ueshin, Xiao Li, Michal Szafranski, Pieter Senster,
+[49] Laurel J. Orr, Srikanth Kandula, and Surajit Chaudhuri. 2019. Pushing Data-
+and Matei Zaharia. 2020. Delta Lake: High-Performance ACID Table Storage
+Induced Predicates Through Joins in Big-Data Clusters. Proc. VLDB Endow. 13, 3
+over Cloud Object Stores. Proc. VLDB Endow. 13, 12 (2020), 3411–3424.
+(2019), 252–265.
+[15] Michael Armbrust, Reynold S Xin, Cheng Lian, Yin Huai, Davies Liu, Joseph K
+[50] Patrick O’Neil, Edward Cheng, Dieter Gawlick, and Elizabeth O’Neil. 1996. The
+Bradley, Xiangrui Meng, Tomer Kaftan, Michael J Franklin, Ali Ghodsi, et al. 2015.
+log-structured merge-tree (LSM-tree). Acta Informatica (1996).
+Spark sql: Relational data processing in spark. In Procs. of SIGMOD. ACM.
+[51] Rahul Potharaju. 2021. NVIDIA GPU Acceleration for Apache Spark™ in Azure
+[16] Nicolas Auger, Cyril Nicaud, and Carine Pivoteau. 2015. Merge strategies: from
+Synapse Analytics. http://aka.ms/synapse-spark-gpu (2021).
+merge sort to Timsort. URL https://hal-upec-upem. archives-ouvertes. fr/hal-
+[52] Rahul Potharaju, Terry Kim, Wentao Wu, Vidip Acharya, Steve Suh, Andrew
+01212839, working paper or preprint (2015).
+Fogarty, Apoorve Dave, Sinduja Ramanujam, Tomas Talius, Lev Novik, and Raghu
+[17] Azure. 2021. Synapse Link. https://docs.microsoft.com/en-us/azure/cosmos-
+Ramakrishnan. 2020. Helios: Hyperscale Indexing for the Cloud & Edge. Proc.
+db/synapse-link.
+VLDB Endow. 13, 12 (2020), 3231–3244.
+[18] Lorenzo Baldacci and Matteo Golfarelli. 2019. A Cost Model for SPARK SQL.
+[53] Aleksandar Prokopec, Nathan Grasso Bronson, Phil Bagwell, and Martin Odersky.
+IEEE Trans. Knowl. Data Eng. 31, 5 (2019), 819–832.
+2012. Concurrent tries with efficient non-blocking snapshots. In PPOPP. 151–160.
+[19] Brad Calder, Ju Wang, Aaron Ogus, Niranjan Nilakantan, Arild Skjolsvold, Sam
+[54] Shi Qiao, Adrian Nicoara, Jin Sun, Marc Friedman, Hiren Patel, and Jaliya
+McKelvie, Yikang Xu, Shashwat Srivastav, Jiesheng Wu, Huseyin Simitci, et al.
+Ekanayake. 2019. Hyper Dimension Shuffle: Efficient Data Repartition at Petabyte
+2011. Windows Azure Storage: a highly available cloud storage service with
+Scale in Scope. PVLDB 12, 10 (2019), 1113–1125.
+strong consistency. In SOSP.
+[55] Eunjin Song Rahul Potharaju, Terry Kim. 2021. Hyperspace for Delta Lake.
+[20] Surajit Chaudhuri and Vivek R. Narasayya. 1997. An Efficient Cost-Driven Index
+https://aka.ms/sais2021-hyperspace-for-delta-lake (2021).
+Selection Tool for Microsoft SQL Server. In VLDB. 146–155.
+[56] Terry Kim Rahul Potharaju. 2020. Hyperspace: An Indexing Sub-system for
+[21] Surajit Chaudhuri and Vivek R. Narasayya. 1998. AutoAdmin ’What-if’ Index
+Apache Spark. https://aka.ms/sais2020-hyperspace (2020).
+Analysis Utility. In SIGMOD. 367–378.
+[57] Raghu Ramakrishnan, Baskar Sridharan, John R Douceur, Pavan Kasturi, Balaji
+[22] Douglas Comer. 1979. The Ubiquitous B-Tree. ACM Comput. Surv. 11, 2 (1979),
+Krishnamachari-Sampath, Karthick Krishnamoorthy, Peng Li, Mitica Manu, Spiro
+121–137.
+Michaylov, Rogério Ramos, et al. 2017. Azure Data Lake Store: A Hyperscale
+[23] DataBricks. 2015. Deep Dive into Spark SQL’s Catalyst Optimizer. https://goo.gl/
+Distributed File Service for Big Data Analytics. In Procs. of ICMD. ACM, 51–63.
+GZtSWC.
+[58] Hanan Samet. 1989. Hierarchical Spatial Data Structures. In SSD. 193–212.
+[24] Dremio. 2020. Reflections. https://docs.dremio.com/acceleration/reflections.html.
+[59] Konstantin Shvachko, Hairong Kuang, Sanjay Radia, and Robert Chansler. 2010.
+[25] Jennie Duggan, Aaron J. Elmore, Michael Stonebraker, Magdalena Balazinska, Bill
+The hadoop distributed file system. In MSST.
+Howe, Jeremy Kepner, Sam Madden, David Maier, Tim Mattson, and Stanley B.
+[60] Michael Stonebraker, Daniel J. Abadi, Adam Batkin, Xuedong Chen, Mitch Cher-
+Zdonik. 2015. The BigDAWG Polystore System. SIGMOD Rec. 44, 2 (2015), 11–16.
+niack, Miguel Ferreira, Edmond Lau, Amerson Lin, Samuel Madden, Elizabeth J.
+[26] Ronald Fagin, Jürg Nievergelt, Nicholas Pippenger, and H. Raymond Strong. 1979.
+O’Neil, Patrick E. O’Neil, Alex Rasin, Nga Tran, and Stanley B. Zdonik. 2005.
+Extendible Hashing - A Fast Access Method for Dynamic Files. ACM Trans.
+C-Store: A Column-oriented DBMS. In VLDB. 553–564.
+Database Syst. 4, 3 (1979), 315–344.
+[61] Ashish Thusoo, Joydeep Sen Sarma, Namit Jain, Zheng Shao, Prasad Chakka,
+[27] Apache Foundation. 2020. Apache Hudi. https://github.com/apache/hudi.
+Suresh Anthony, Hao Liu, Pete Wyckoff, and Raghotham Murthy. 2009. Hive: a
+[28] Apache Foundation. 2020. Apache Iceberg. https://iceberg.apache.org/spark/.
+warehousing solution over a map-reduce framework. Proceedings of the VLDB
+[29] Apache Foundation. 2021. Apache Spark. https://github.com/apache/spark.
+Endowment 2, 2 (2009), 1626–1629.
+[30] Linux Foundation. 2020. Delta Lake. https://github.com/delta-io/delta.
+[62] Alexandru Uta, Bogdan Ghit, Ankur Dave, and Peter A. Boncz. 2019. [Demo]
+[31] Antonin Guttman. 1984. R-Trees: A Dynamic Index Structure for Spatial Search-
+Low-latency Spark Queries on Updatable Data. In SIGMOD. 2009–2012.
+ing. In SIGMOD. 47–57.
+[63] Gary Valentin, Michael Zuliani, Daniel C. Zilio, Guy M. Lohman, and Alan Skelley.
+[32] Herodotos Herodotou. 2011. Hadoop Performance Models. CoRR abs/1106.0940
+2000. DB2 Advisor: An Optimizer Smart Enough to Recommend Its Own Indexes.
+(2011).
+In ICDE. 101–110.
+[33] Herodotos Herodotou and Shivnath Babu. 2011. Profiling, What-if Analysis,
+[64] Le Xu, Shivaram Venkataraman, Indranil Gupta, Luo Mai, and Rahul Potharaju.
+and Cost-based Optimization of MapReduce Programs. PVLDB 4, 11 (2011),
+2021. Move Fast and Meet Deadlines: Fine-grained Real-time Stream Processing
+1111–1122.
+with Cameo. In NSDI.
+[34] Herodotos Herodotou and Shivnath Babu. 2013. A What-if Engine for Cost-based
+[65] Jia Yu, Zongsi Zhang, and Mohamed Sarwat. 2019. Spatial data management
+MapReduce Optimization. IEEE Data Eng. Bull. 36, 1 (2013), 5–14.
+in apache spark: the GeoSpark perspective and beyond. GeoInformatica 23, 1
+[35] Alekh Jindal, Konstantinos Karanasos, Sriram Rao, and Hiren Patel. 2018. Select-
+(2019).
+ing Subexpressions to Materialize at Datacenter Scale. Proc. VLDB Endow. 11, 7
+[66] Matei Zaharia, Mosharaf Chowdhury, Tathagata Das, Ankur Dave, Justin Ma,
+(2018), 800–812.
+Murphy McCauly, Michael J. Franklin, Scott Shenker, and Ion Stoica. 2012. Re-
+silient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster
+Computing. In NSDI. 15–28.
+3055
